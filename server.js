@@ -1,8 +1,9 @@
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 
 const port = Number(process.env.PORT || 3000);
+const basePath = '/stock12-8';
 const root = new URL('.', import.meta.url).pathname;
 const cache = new Map();
 const mime = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
@@ -42,11 +43,28 @@ async function chart(symbol) {
   if (!data) data = await stooqDaily(key);
   const latest = data.slice(-180); cache.set(key, {at:Date.now(), data:latest}); return latest;
 }
+async function assetVersion(file) {
+  return String(Math.floor((await stat(join(root, 'public', file))).mtimeMs));
+}
 http.createServer(async (req,res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname === '/api/chart') { const data = await chart((url.searchParams.get('symbol') || '005930').replace(/[^0-9A-Za-z.^-]/g,'')); res.writeHead(200, {'content-type':'application/json','cache-control':'no-store'}); return res.end(JSON.stringify({data, source:process.env.KIS_APP_KEY ? 'KIS API' : 'Stooq (개발용)'})); }
-    const path = url.pathname === '/' ? '/index.html' : url.pathname;
-    const body = await readFile(join(root, 'public', path)); res.writeHead(200, {'content-type':mime[extname(path)] || 'application/octet-stream'}); res.end(body);
+    // Accept both direct Node access and the /stock12-8 Nginx reverse-proxy path.
+    const requestPath = url.pathname.startsWith(`${basePath}/`) ? url.pathname.slice(basePath.length) : url.pathname;
+    if (requestPath === '/api/chart') { const data = await chart((url.searchParams.get('symbol') || '005930').replace(/[^0-9A-Za-z.^-]/g,'')); res.writeHead(200, {'content-type':'application/json','cache-control':'no-store, no-cache, must-revalidate, max-age=0'}); return res.end(JSON.stringify({data, source:process.env.KIS_APP_KEY ? 'KIS API' : 'Stooq (개발용)'})); }
+    const path = requestPath === '/' ? '/index.html' : requestPath;
+    if (!path.startsWith('/') || path.includes('..')) throw Object.assign(new Error('Not found'), {code:'ENOENT'});
+    let body = await readFile(join(root, 'public', path));
+    const headers = {'content-type':mime[extname(path)] || 'application/octet-stream'};
+    if (path === '/index.html') {
+      const [appVersion, styleVersion] = await Promise.all([assetVersion('app.js'), assetVersion('styles.css')]);
+      body = Buffer.from(body.toString().replace('__APP_VERSION__', appVersion).replace('__STYLE_VERSION__', styleVersion));
+      headers['cache-control'] = 'no-store, no-cache, must-revalidate, max-age=0';
+    } else if (path === '/app.js' || path === '/styles.css') {
+      headers['cache-control'] = 'public, max-age=31536000, immutable';
+    } else {
+      headers['cache-control'] = 'no-cache';
+    }
+    res.writeHead(200, headers); res.end(body);
   } catch (error) { res.writeHead(error.code === 'ENOENT' ? 404 : 500, {'content-type':'application/json'}); res.end(JSON.stringify({error:error.message})); }
 }).listen(port, () => console.log(`Stock12 running at http://localhost:${port}`));
