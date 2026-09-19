@@ -34,13 +34,13 @@ function aggregate(data, count) {
   for (let i = 0; i < data.length; i += count) { const part = data.slice(i, i + count); if (part.length) bars.push({date:part.at(-1).date,open:part[0].open,high:Math.max(...part.map(x=>x.high)),low:Math.min(...part.map(x=>x.low)),close:part.at(-1).close}); }
   return bars;
 }
-async function kisIntraday(code, minutes) {
+async function kisIntraday(code, minutes, session) {
   const auth = await kisToken(); if (!auth) return null;
   const { appKey, appSecret, base, access_token } = auth;
   const response = await fetch(`${base}/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice?FID_COND_MRKT_DIV_CODE=J&FID_INPUT_ISCD=${encodeURIComponent(code)}&FID_INPUT_HOUR_1=153000&FID_PW_DATA_INCU_YN=Y&FID_ETC_CLS_CODE=`, { headers: { authorization:`Bearer ${access_token}`, appkey:appKey, appsecret:appSecret, tr_id:'FHKST03010200' } });
   if (!response.ok) throw new Error('KIS 분봉 요청에 실패했습니다.');
   const json = await response.json();
-  const data = (json.output2 || []).reverse().map(x => ({date:`${x.stck_bsop_date || ''} ${x.stck_cntg_hour || ''}`.trim(),open:+x.stck_oprc,high:+x.stck_hgpr,low:+x.stck_lwpr,close:+x.stck_prpr})).filter(x => x.close && x.open && x.high && x.low);
+  const data = (json.output2 || []).reverse().filter(x => session === 'after' ? x.stck_cntg_hour > '153000' : x.stck_cntg_hour >= '090000' && x.stck_cntg_hour <= '153000').map(x => ({date:`${x.stck_bsop_date || ''} ${x.stck_cntg_hour || ''}`.trim(),open:+x.stck_oprc,high:+x.stck_hgpr,low:+x.stck_lwpr,close:+x.stck_prpr})).filter(x => x.close && x.open && x.high && x.low);
   return aggregate(data, minutes);
 }
 async function yahooIntraday(symbol, minutes) {
@@ -66,12 +66,12 @@ async function stooqDaily(symbol) {
   const q = result?.indicators?.quote?.[0] || {}, times = result?.timestamp || [];
   return times.map((time,i) => ({date:new Date(time*1000).toISOString().slice(0,10),open:q.open?.[i],high:q.high?.[i],low:q.low?.[i],close:q.close?.[i]})).filter(x => x.close && x.open && x.high && x.low);
 }
-async function chart(symbol, interval = 'd') {
-  const key = `${symbol.toUpperCase()}:${interval}`, old = cache.get(key);
+async function chart(symbol, interval = 'd', session = 'regular') {
+  const key = `${symbol.toUpperCase()}:${interval}:${session}`, old = cache.get(key);
   if (old && Date.now() - old.at < 60_000) return old.data;
   const intradayMinutes = { '1m':1, '3m':3, '5m':5, '10m':10, '15m':15, '30m':30, '60m':60 }[interval];
   let data, source;
-  if (intradayMinutes) { try { data = await kisIntraday(symbol, intradayMinutes); source = 'KIS API 분봉'; } catch (error) { console.warn(error.message); } if (!data?.length) { data = await yahooIntraday(symbol, intradayMinutes); source = 'Yahoo 분봉 (개발용)'; } }
+  if (intradayMinutes) { try { data = await kisIntraday(symbol, intradayMinutes, session); source = `KIS API ${session === 'after' ? '장후' : '정규장'} 분봉`; } catch (error) { console.warn(error.message); } if (!data?.length) { data = await yahooIntraday(symbol, intradayMinutes); source = 'Yahoo 분봉 (개발용)'; } }
   else { try { data = await kisDaily(symbol); source = 'KIS API 일봉'; } catch (error) { console.warn(error.message); } if (!data) { data = await stooqDaily(symbol); source = 'Stooq 일봉 (개발용)'; } data = aggregate(data, interval === 'w' ? 5 : interval === 'mo' ? 20 : 1); }
   const latest = data.slice(-180); cache.set(key, {at:Date.now(), data:{data:latest,source}}); return {data:latest,source};
 }
@@ -83,7 +83,7 @@ http.createServer(async (req,res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     // Accept both direct Node access and the /stock12-8 Nginx reverse-proxy path.
     const requestPath = url.pathname.startsWith(`${basePath}/`) ? url.pathname.slice(basePath.length) : url.pathname;
-    if (requestPath === '/api/chart') { const symbol = (url.searchParams.get('symbol') || '005930').replace(/[^0-9A-Za-z.^-]/g,''); const interval = ['1m','3m','5m','10m','15m','30m','60m','d','w','mo'].includes(url.searchParams.get('interval')) ? url.searchParams.get('interval') : 'd'; const result = await chart(symbol, interval); res.writeHead(200, {'content-type':'application/json','cache-control':'no-store, no-cache, must-revalidate, max-age=0'}); return res.end(JSON.stringify(result)); }
+    if (requestPath === '/api/chart') { const symbol = (url.searchParams.get('symbol') || '005930').replace(/[^0-9A-Za-z.^-]/g,''); const interval = ['1m','3m','5m','10m','15m','30m','60m','d','w','mo'].includes(url.searchParams.get('interval')) ? url.searchParams.get('interval') : 'd'; const session = url.searchParams.get('session') === 'after' ? 'after' : 'regular'; const result = await chart(symbol, interval, session); res.writeHead(200, {'content-type':'application/json','cache-control':'no-store, no-cache, must-revalidate, max-age=0'}); return res.end(JSON.stringify(result)); }
     const path = requestPath === '/' ? '/index.html' : requestPath;
     if (!path.startsWith('/') || path.includes('..')) throw Object.assign(new Error('Not found'), {code:'ENOENT'});
     let body = await readFile(join(root, 'public', path));
